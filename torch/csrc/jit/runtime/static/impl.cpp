@@ -19,6 +19,7 @@
 #include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/subgraph_rewrite.h>
 #include <torch/csrc/jit/passes/variadic_ops.h>
+#include <torch/csrc/jit/runtime/static/fusion.h>
 #include <torch/csrc/jit/runtime/static/memory_planner.h>
 #include <torch/csrc/jit/runtime/static/ops.h>
 #include <torch/csrc/jit/runtime/static/passes.h>
@@ -96,8 +97,13 @@ namespace {
 
 void OptimizeGraph(
     std::shared_ptr<torch::jit::Graph>& graph,
+    std::vector<IValue> sample_inputs,
     const StaticModuleOptions& opts) {
   GRAPH_DUMP("Before optimizations: ", graph);
+  if (!sample_inputs.empty() && opts.enable_tensorexpr_fusion) {
+    VLOG(1) << "Performing TensorExpr fusion";
+    performTensorExprFusion(graph, std::move(sample_inputs));
+  }
   Inline(*graph);
   ConstantPropagation(graph);
   Canonicalize(graph);
@@ -133,6 +139,11 @@ void OptimizeGraph(
   EliminateNoOps(
       graph, /* custom_ops */ {fromQualString("fb::scale_gradient")});
   GRAPH_DUMP("Final graph after optimizations: ", graph);
+}
+
+bool IsSelfInGraphInput(std::shared_ptr<torch::jit::Graph>& graph) {
+  return graph->inputs().size() > 0 &&
+      graph->inputs().at(0)->type()->is_module();
 }
 
 // remove unused input 0 from graph
@@ -180,7 +191,7 @@ void PrepareGraphForStaticModule(
     const StaticModuleOptions& opts,
     std::vector<IValue> sample_inputs) {
   TORCH_CHECK(canEnableStaticRuntime(graph));
-  OptimizeGraph(graph, opts);
+  OptimizeGraph(graph, sample_inputs, opts);
 }
 
 std::pair<std::shared_ptr<Graph>, c10::optional<Module>> PrepareForStaticModule(
@@ -192,7 +203,8 @@ std::pair<std::shared_ptr<Graph>, c10::optional<Module>> PrepareForStaticModule(
           << opts.cleanup_activations << ", enable_out_variant "
           << opts.enable_out_variant << ", optimize_memory "
           << opts.optimize_memory << ", manage_output_tensors "
-          << opts.manage_output_tensors;
+          << opts.manage_output_tensors << ", enable_tensorexpr_fusion "
+          << opts.enable_tensorexpr_fusion;
 
   Module module = m.copy();
   if (!is_frozen) {
@@ -203,7 +215,12 @@ std::pair<std::shared_ptr<Graph>, c10::optional<Module>> PrepareForStaticModule(
   Method method = module.get_method("forward");
   auto graph = module.get_method("forward").graph();
 
-  PrepareGraphForStaticModule(graph, opts, sample_inputs);
+  if (!sample_inputs.empty()) {
+    if (IsSelfInGraphInput(graph)) {
+      sample_inputs.insert(sample_inputs.begin(), m._ivalue());
+    }
+  }
+  PrepareGraphForStaticModule(graph, opts, std::move(sample_inputs));
 
   return std::make_pair(graph, module);
 }
@@ -212,7 +229,7 @@ std::pair<std::shared_ptr<Graph>, c10::optional<Module>> PrepareForStaticModule(
     std::shared_ptr<torch::jit::Graph> graph,
     const StaticModuleOptions& opts,
     std::vector<IValue> sample_inputs) {
-  PrepareGraphForStaticModule(graph, opts, sample_inputs);
+  PrepareGraphForStaticModule(graph, opts, std::move(sample_inputs));
   return std::make_pair(graph, c10::nullopt);
 }
 
@@ -436,7 +453,7 @@ StaticModule::StaticModule(
     const StaticModuleOptions& opts,
     std::vector<IValue> sample_inputs)
     : StaticModule(
-          PrepareForStaticModule(g->copy(), opts, sample_inputs),
+          PrepareForStaticModule(g->copy(), opts, std::move(sample_inputs)),
           opts) {}
 
 StaticModule::StaticModule(
@@ -445,7 +462,7 @@ StaticModule::StaticModule(
     const StaticModuleOptions& opts,
     std::vector<IValue> sample_inputs)
     : StaticModule(
-          PrepareForStaticModule(m, is_frozen, opts, sample_inputs),
+          PrepareForStaticModule(m, is_frozen, opts, std::move(sample_inputs)),
           opts) {}
 
 StaticModule::StaticModule(
